@@ -3,9 +3,13 @@ import type { Plugin, ViteDevServer } from 'vite'
 // Type-only, so it is erased at build time and never triggers a runtime
 // resolution of '@oga/supabase' from vite.config.ts's module graph.
 import type { Database } from '@oga/supabase'
+import type { GeoPoint } from '@oga/core'
+
+import { rejectNonLocalRequest } from './dev-local-only'
 
 type OgaSupabaseModule = typeof import('@oga/supabase')
 type OgaSupabaseClient = ReturnType<OgaSupabaseModule['createOgaServiceClient']>
+type OgaCoreModule = typeof import('@oga/core')
 type CrawlStateRow = Database['public']['Tables']['crawl_state']['Row']
 
 /** The dev Supabase project. Anything else is production — the page paints a red banner. */
@@ -22,6 +26,17 @@ const DAY_MS = 86_400_000
 // something structural like geography), page through it with this size.
 const POSTGREST_PAGE_SIZE = 1000
 
+export interface DuplicateMatch {
+  id: string
+  name: string
+  city: string | null
+  state: string | null
+  pending: boolean
+  tier: 'likely' | 'possible'
+  reason: 'exact-name' | 'name-containment' | 'proximity'
+  metres?: number
+}
+
 export interface PendingCourse {
   id: string
   name: string
@@ -29,6 +44,15 @@ export interface PendingCourse {
   state: string | null
   created_by: string | null
   created_at: string
+  rounds: number
+  roundsByOthers: number
+  holes: number
+  holesMapped: number
+  holeSpanM: number
+  centroid: { lat: number; lng: number } | null
+  tees: number
+  submitterPending: number
+  duplicates: DuplicateMatch[]
 }
 
 export interface PendingPanel {
@@ -106,15 +130,224 @@ async function countOf(
   return count ?? 0
 }
 
-async function pendingPanel(client: OgaSupabaseClient): Promise<PendingPanel> {
-  const { data, error, count } = await client
-    .from('courses')
-    .select('id,name,city,state,created_by,created_at', { count: 'exact' })
-    .is('approved_at', null)
-    .order('created_at', { ascending: false })
-    .limit(50)
-  if (error) throw new Error(error.message)
-  return { total: count ?? 0, rows: (data ?? []) as unknown as PendingCourse[] }
+// ~1 km, as a latitude delta for a cheap bounding box before the exact
+// haversine filter. Longitude degrees shrink with latitude, hence the cosine:
+// without it the box is far too narrow in Scotland and too wide near the
+// equator. The clamp stops a division blowup at the poles.
+const NEARBY_LAT_DELTA = 0.01
+const NEARBY_MAX_M = 1000
+
+interface CandidateRow {
+  id: string
+  name: string
+  city: string | null
+  state: string | null
+  lat: number | null
+  lng: number | null
+  approved_at: string | null
+}
+
+function toMatch(c: CandidateRow): Omit<DuplicateMatch, 'tier' | 'reason'> {
+  return {
+    id: c.id,
+    name: c.name,
+    city: c.city,
+    state: c.state,
+    pending: c.approved_at === null,
+  }
+}
+
+async function findDuplicates(
+  client: OgaSupabaseClient,
+  core: OgaCoreModule,
+  row: PendingCourse,
+): Promise<DuplicateMatch[]> {
+  const matches = new Map<string, DuplicateMatch>()
+  const self = { name: row.name, city: row.city, state: row.state }
+
+  // --- by name --------------------------------------------------------
+  // Queries ALL courses, not just approved: "The Bel Short Course" appears
+  // twice in this queue today, same submitter, 0 m apart. An approved-only
+  // query flags neither of them.
+  const token = core.distinctiveToken(row.name)
+  if (token) {
+    const { data, error, count } = await client
+      .from('courses')
+      .select('id,name,city,state,lat,lng,approved_at', { count: 'exact' })
+      .ilike('name', `%${token}%`)
+      .neq('id', row.id)
+      .limit(200)
+    if (error) throw new Error(error.message)
+    const candidates = (data ?? []) as unknown as CandidateRow[]
+    if ((count ?? 0) > candidates.length) {
+      // Surfaced, not swallowed: a silent truncation here is a false
+      // negative, which is the failure this panel exists to prevent.
+      matches.set('__truncated__', {
+        id: '__truncated__',
+        name: `${count} name candidates for "${token}", only ${candidates.length} checked`,
+        city: null,
+        state: null,
+        pending: false,
+        tier: 'possible',
+        reason: 'name-containment',
+      })
+    }
+    const a = core.normalizeCourseName(row.name)
+    for (const c of candidates) {
+      const b = core.normalizeCourseName(c.name)
+      if (core.isProbableSameCourse(self, { name: c.name, city: c.city, state: c.state })) {
+        matches.set(c.id, { ...toMatch(c), tier: 'likely', reason: 'exact-name' })
+      } else if (a && b && (a.includes(b) || b.includes(a))) {
+        matches.set(c.id, { ...toMatch(c), tier: 'possible', reason: 'name-containment' })
+      }
+    }
+  }
+
+  // --- by geography ----------------------------------------------------
+  // Catches what names cannot: "Sundridge Park West" is 513 m from the
+  // approved "Sundridge Park Golf Course" and shares no normalized name.
+  if (row.centroid) {
+    const { lat, lng } = row.centroid
+    const lngDelta = NEARBY_LAT_DELTA / Math.max(Math.cos((lat * Math.PI) / 180), 0.01)
+    const { data, error, count } = await client
+      .from('courses')
+      .select('id,name,city,state,lat,lng,approved_at', { count: 'exact' })
+      .neq('id', row.id)
+      .gte('lat', lat - NEARBY_LAT_DELTA)
+      .lte('lat', lat + NEARBY_LAT_DELTA)
+      .gte('lng', lng - lngDelta)
+      .lte('lng', lng + lngDelta)
+      .limit(50)
+    if (error) throw new Error(error.message)
+    const near = (data ?? []) as unknown as CandidateRow[]
+    if ((count ?? 0) > near.length) {
+      // Same invariant the name branch defends: a silent truncation is a
+      // false negative, which is the failure this panel exists to prevent.
+      matches.set('__truncated-geo__', {
+        id: '__truncated-geo__',
+        name: `${count} courses inside the 1 km box, only ${near.length} checked`,
+        city: null,
+        state: null,
+        pending: false,
+        tier: 'possible',
+        reason: 'proximity',
+      })
+    }
+    for (const c of near) {
+      if (c.lat == null || c.lng == null) continue
+      const metres = core.haversineYards(lat, lng, c.lat, c.lng) * core.YARDS_TO_METERS
+      if (metres > NEARBY_MAX_M) continue
+      // Never downgrade an exact-name hit to a proximity one.
+      if (matches.get(c.id)?.tier === 'likely') continue
+      matches.set(c.id, {
+        ...toMatch(c),
+        tier: 'possible',
+        reason: 'proximity',
+        metres: Math.round(metres),
+      })
+    }
+  }
+
+  return [...matches.values()]
+}
+
+async function pendingPanel(
+  client: OgaSupabaseClient,
+  core: OgaCoreModule,
+): Promise<PendingPanel> {
+  // One embedded query instead of a per-row fan-out. Paginated for the same
+  // reason as everything else here: an unranged select silently truncates at
+  // PostgREST's 1000-row default (see POSTGREST_PAGE_SIZE above).
+  type Row = {
+    id: string
+    name: string
+    city: string | null
+    state: string | null
+    created_by: string | null
+    created_at: string
+    holes: { number: number; tee_lat: number | null; tee_lng: number | null }[] | null
+    rounds: { user_id: string }[] | null
+    course_tees: { id: string }[] | null
+  }
+
+  const raw: Row[] = []
+  let start = 0
+  for (;;) {
+    const { data, error } = await client
+      .from('courses')
+      .select(
+        'id,name,city,state,created_by,created_at,holes(number,tee_lat,tee_lng),rounds(user_id),course_tees(id)',
+      )
+      .is('approved_at', null)
+      .range(start, start + POSTGREST_PAGE_SIZE - 1)
+    if (error) throw new Error(error.message)
+    const page = (data ?? []) as unknown as Row[]
+    raw.push(...page)
+    if (page.length < POSTGREST_PAGE_SIZE) break
+    start += POSTGREST_PAGE_SIZE
+  }
+
+  // "Other submissions by this submitter" means other rows in THIS queue.
+  // Flood detection is about the queue, and queue-scoping makes it free —
+  // it falls out of the rows already fetched instead of a query per submitter.
+  const pendingBySubmitter = new Map<string, number>()
+  for (const r of raw) {
+    if (!r.created_by) continue
+    pendingBySubmitter.set(r.created_by, (pendingBySubmitter.get(r.created_by) ?? 0) + 1)
+  }
+
+  const rows: PendingCourse[] = raw.map((r) => {
+    const holes = r.holes ?? []
+    const mapped: GeoPoint[] = holes
+      .filter((h) => h.tee_lat != null && h.tee_lng != null)
+      .map((h) => ({ lat: h.tee_lat as number, lng: h.tee_lng as number }))
+    const roundRows = r.rounds ?? []
+    return {
+      id: r.id,
+      name: r.name,
+      city: r.city,
+      state: r.state,
+      created_by: r.created_by,
+      created_at: r.created_at,
+      rounds: roundRows.length,
+      // 0053 gated on rounds by SOMEONE ELSE ("self-evidently real"). Every
+      // rounds-bearing row in this queue is self-logged today, so collapsing
+      // the two numbers would present self-attestation as corroboration.
+      // A null created_by is an ORPHAN, not a third party: 0001 declares
+      // created_by `on delete set null`, so deleting an account empties it
+      // while approved_at stays null and the row stays queued. Without the
+      // null check every round counts as corroboration and the least
+      // attributable row in the queue sorts to the top of it.
+      roundsByOthers: roundRows.filter(
+        (x) => r.created_by != null && x.user_id !== r.created_by,
+      ).length,
+      holes: holes.length,
+      holesMapped: mapped.length,
+      holeSpanM: Math.round(core.pointSetDiameter(mapped)),
+      centroid: core.courseCentroid(mapped),
+      tees: (r.course_tees ?? []).length,
+      submitterPending: r.created_by ? (pendingBySubmitter.get(r.created_by) ?? 1) - 1 : 0,
+      duplicates: [],
+    }
+  })
+
+  // Sort by evidence, not recency. 0027 permits 50 submissions per user per
+  // day, so a created_at sort lets one account push real rows off the page.
+  rows.sort(
+    (a, b) =>
+      b.roundsByOthers - a.roundsByOthers ||
+      b.rounds - a.rounds ||
+      b.holesMapped - a.holesMapped ||
+      a.name.localeCompare(b.name),
+  )
+
+  const shown = rows.slice(0, 50)
+  // Sequential, not Promise.all: up to 100 queries against production, and a
+  // burst buys nothing on a page one person loads.
+  for (const row of shown) {
+    row.duplicates = await findDuplicates(client, core, row)
+  }
+  return { total: rows.length, rows: shown }
 }
 
 async function crawlerPanel(client: OgaSupabaseClient): Promise<CrawlerPanel> {
@@ -278,10 +511,18 @@ function refFromUrl(url: string): string {
 export function devAdminApi(): Plugin {
   let modPromise: Promise<OgaSupabaseModule> | null = null
   let clientPromise: Promise<OgaSupabaseClient | null> | null = null
+  let corePromise: Promise<OgaCoreModule> | null = null
 
   function loadOgaModule(server: ViteDevServer): Promise<OgaSupabaseModule> {
     modPromise ??= server.ssrLoadModule('@oga/supabase') as Promise<OgaSupabaseModule>
     return modPromise
+  }
+
+  function loadCore(server: ViteDevServer): Promise<OgaCoreModule> {
+    // Same reasoning as loadOgaModule above: @oga/core is raw TS with
+    // extensionless relative imports, which Node's loader cannot follow.
+    corePromise ??= server.ssrLoadModule('@oga/core') as Promise<OgaCoreModule>
+    return corePromise
   }
 
   function getClient(server: ViteDevServer): Promise<OgaSupabaseClient | null> {
@@ -318,6 +559,9 @@ export function devAdminApi(): Plugin {
         )
       }
       server.middlewares.use('/api/dev-admin', async (req, res, next) => {
+        // First, before anything reaches the service-role client: these routes
+        // run ahead of Vite's own host check, so they must do it themselves.
+        if (rejectNonLocalRequest(req, res, 'dev-admin-api')) return
         const client = await getClient(server)
         if (!client) {
           sendJson(res, 500, { error: 'SUPABASE_SERVICE_ROLE_KEY not set on the dev server' })
@@ -331,8 +575,9 @@ export function devAdminApi(): Plugin {
           if (segments[0] === 'stats' && segments.length === 1 && method === 'GET') {
             const url = process.env.SUPABASE_URL || 'http://127.0.0.1:54321'
             const projectRef = refFromUrl(url)
+            const core = await loadCore(server)
             const [pending, crawler, usage, quality] = await Promise.all([
-              panel(() => pendingPanel(client)),
+              panel(() => pendingPanel(client, core)),
               panel(() => crawlerPanel(client)),
               panel(() => usagePanel(client)),
               panel(() => qualityPanel(client)),
