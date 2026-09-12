@@ -2,6 +2,28 @@ import { useMemo } from 'react'
 import Mapbox from '@rnmapbox/maps'
 import type { LatLng } from '../HoleMap.types'
 
+// Pixel nudge for the OB disc when a re-hit covers it, matching web's
+// [-20, 0] in useMapLayers.ts. `circle-translate` / `text-translate` are
+// paint properties and are NOT data-driven, which is why the shifted and
+// unshifted cases need separate layers rather than an expression (#839).
+const OB_NUDGE: [number, number] = [-20, 0]
+
+const OB_DISC_STYLE = {
+  circleRadius: 10,
+  // caddie-neg — matches the live chip / scorecard penalty colour.
+  circleColor: '#A33A2A',
+  circleStrokeColor: '#FBF8F1',
+  circleStrokeWidth: 2,
+} as const
+
+const OB_NUMBER_STYLE = {
+  textField: ['get', 'n'],
+  textSize: 11,
+  textColor: '#FBF8F1',
+  textAllowOverlap: true,
+  textIgnorePlacement: true,
+} as const
+
 function toCoord(l: LatLng): [number, number] {
   return [l.lng, l.lat]
 }
@@ -37,17 +59,35 @@ export function BreadcrumbLayers({
   toDisplay,
   obs,
 }: BreadcrumbLayersProps) {
-  const waypointFeatures = useMemo<GeoJSON.FeatureCollection<GeoJSON.Point>>(
-    () => ({
+  const waypointFeatures = useMemo<GeoJSON.FeatureCollection<GeoJSON.Point>>(() => {
+    const coords = previousShots.map(toCoord)
+    // Mirrors web's coincidence guard (useMapLayers.ts): the OB disc only
+    // gets nudged aside when something else really is on the same
+    // coordinate — a lone OB shot stays dead centre in its ring. Without
+    // this the platforms disagree in exactly the case the guard exists for,
+    // e.g. after tagging OB but before the re-hit is logged.
+    const shareCount = new Map<string, number>()
+    for (const c of coords) {
+      const k = `${c[0]},${c[1]}`
+      shareCount.set(k, (shareCount.get(k) ?? 0) + 1)
+    }
+    return {
       type: 'FeatureCollection',
-      features: previousShots.map((p, i) => ({
-        type: 'Feature',
-        properties: { n: i + 1, ob: obs?.[i] === true },
-        geometry: { type: 'Point', coordinates: toCoord(p) },
-      })),
-    }),
-    [previousShots, obs],
-  )
+      features: previousShots.map((_p, i) => {
+        const c = coords[i]!
+        const ob = obs?.[i] === true
+        return {
+          type: 'Feature',
+          properties: {
+            n: i + 1,
+            ob,
+            obShifted: ob && (shareCount.get(`${c[0]},${c[1]}`) ?? 0) > 1,
+          },
+          geometry: { type: 'Point', coordinates: c },
+        }
+      }),
+    }
+  }, [previousShots, obs])
 
   const segmentFeatures = useMemo<GeoJSON.FeatureCollection<GeoJSON.Point>>(
     () => ({
@@ -106,19 +146,27 @@ export function BreadcrumbLayers({
             circleStrokeWidth: 3,
           }}
         />
+        {/* Non-OB discs/numbers. The OB shot is split into its own pair of
+            layers below so it can be nudged aside: the ring above marks the
+            true origin, but the re-hit's disc lands on the exact same
+            coordinate and was covering the OB shot's number entirely, so the
+            map could show THAT a penalty happened but never WHICH shot took
+            it. `circle-translate` / `text-translate` are pixel offsets and
+            are NOT data-driven, which is why this needs separate layers
+            rather than an expression (#839). */}
         <Mapbox.CircleLayer
           id="prevShotsWaypointDisc"
+          filter={['!=', ['get', 'ob'], true]}
           style={{
             circleRadius: 10,
-            // caddie-neg (#A33A2A) for the shot that went OB, matching the
-            // live chip / scorecard penalty color; amber for everything else.
-            circleColor: ['case', ['==', ['get', 'ob'], true], '#A33A2A', '#A66A1F'],
+            circleColor: '#A66A1F',
             circleStrokeColor: '#FBF8F1',
             circleStrokeWidth: 2,
           }}
         />
         <Mapbox.SymbolLayer
           id="prevShotsWaypointNumber"
+          filter={['!=', ['get', 'ob'], true]}
           style={{
             textField: ['get', 'n'],
             textSize: 11,
@@ -126,6 +174,29 @@ export function BreadcrumbLayers({
             textAllowOverlap: true,
             textIgnorePlacement: true,
           }}
+        />
+        {/* Two pairs, not one: the nudge only applies when a re-hit really is
+            on the same coordinate (obShifted). A lone OB shot renders dead
+            centre in its ring, matching web. */}
+        <Mapbox.CircleLayer
+          id="prevShotsObDisc"
+          filter={['all', ['==', ['get', 'ob'], true], ['!=', ['get', 'obShifted'], true]]}
+          style={OB_DISC_STYLE}
+        />
+        <Mapbox.CircleLayer
+          id="prevShotsObDiscShifted"
+          filter={['all', ['==', ['get', 'ob'], true], ['==', ['get', 'obShifted'], true]]}
+          style={{ ...OB_DISC_STYLE, circleTranslate: OB_NUDGE }}
+        />
+        <Mapbox.SymbolLayer
+          id="prevShotsObNumber"
+          filter={['all', ['==', ['get', 'ob'], true], ['!=', ['get', 'obShifted'], true]]}
+          style={OB_NUMBER_STYLE}
+        />
+        <Mapbox.SymbolLayer
+          id="prevShotsObNumberShifted"
+          filter={['all', ['==', ['get', 'ob'], true], ['==', ['get', 'obShifted'], true]]}
+          style={{ ...OB_NUMBER_STYLE, textTranslate: OB_NUDGE }}
         />
       </Mapbox.ShapeSource>
 
