@@ -8,7 +8,9 @@ import {
   destinationYards,
   formatClubLabel,
   isPuttShot,
+  obCount,
   projectShotMove,
+  resolveHole,
   summarizePuttParts,
   summarizeShotParts,
   type DistanceUnit,
@@ -25,6 +27,7 @@ import { PUTTING_RADIUS_YARDS } from './hole/types'
 
 type HoleRow = Database['public']['Tables']['holes']['Row']
 type HoleScoreRow = Database['public']['Tables']['hole_scores']['Row']
+type HoleTeeRow = Database['public']['Tables']['hole_tees']['Row']
 type ShotRow = Database['public']['Tables']['shots']['Row']
 
 const KICKER: import('react-native').TextStyle = {
@@ -82,6 +85,9 @@ interface PlacedShot {
   shotNumber: number
   start: LatLng | null
   aim: LatLng | null
+  /** Out-of-bounds flag (#839). Optional — fresh drafts (new/unplaced shots)
+   *  omit it and read as false; only the seed-from-`shots` site below sets it. */
+  ob?: boolean
 }
 
 type PlacementMode = Extract<HoleMapPhase, 'PLACE_BALL' | 'SET_AIM' | 'PIN'>
@@ -97,6 +103,13 @@ interface PastRoundMapProps {
   completed: boolean
   holes: HoleRow[]
   holeScores: HoleScoreRow[]
+  /** Per-tee hole overrides for the whole course — sparse, filtered to
+   *  resolvedCourseTeeId below. Yards/par/stroke_index/tee location. */
+  holeTees: HoleTeeRow[]
+  /** The round's resolved course_tees.id (id-then-tee_color fallback,
+   *  already computed by the parent via resolveCourseTee), or null if the
+   *  round has no resolvable tee. */
+  resolvedCourseTeeId: string | null
   shots: ShotRow[]
   unit: DistanceUnit
   courseCenter: LatLng | null
@@ -116,6 +129,8 @@ export function PastRoundMap({
   completed,
   holes,
   holeScores,
+  holeTees,
+  resolvedCourseTeeId,
   shots,
   unit,
   courseCenter,
@@ -140,6 +155,20 @@ export function PastRoundMap({
     [holeScores, currentHole],
   )
 
+  // Tee-resolved par/yards/stroke_index/tee-location — hole_tees override
+  // for the round's resolved tee (if any) over the base holes row, with
+  // hole_scores.par folded in. Sparse by design; falls through to base
+  // values for the common case (no override yet).
+  const resolvedHole = useMemo(() => {
+    if (!currentHole) return null
+    const teeOverride = resolvedCourseTeeId
+      ? holeTees.find(
+          (ht) => ht.hole_id === currentHole.id && ht.course_tee_id === resolvedCourseTeeId,
+        ) ?? null
+      : null
+    return resolveHole(currentHole, teeOverride, { par: currentHoleScore?.par })
+  }, [currentHole, currentHoleScore?.par, holeTees, resolvedCourseTeeId])
+
   const storedPin: LatLng | null = useMemo(
     () =>
       currentHole?.pin_lat != null && currentHole?.pin_lng != null
@@ -157,10 +186,10 @@ export function PastRoundMap({
   const effectivePin = roundPin ?? storedPin
   const tee: LatLng | null = useMemo(
     () =>
-      currentHole?.tee_lat != null && currentHole?.tee_lng != null
-        ? { lat: currentHole.tee_lat, lng: currentHole.tee_lng }
+      resolvedHole?.teeLat != null && resolvedHole?.teeLng != null
+        ? { lat: resolvedHole.teeLat, lng: resolvedHole.teeLng }
         : null,
-    [currentHole],
+    [resolvedHole],
   )
   // Tee-first so the camera orients "up the hole" — useHoleCamera computes
   // heading from center→pin, and centering on the pin (as before) made
@@ -220,6 +249,7 @@ export function PastRoundMap({
               s.aim_lat != null && s.aim_lng != null
                 ? { lat: s.aim_lat, lng: s.aim_lng }
                 : null,
+            ob: s.ob === true,
           }))
       : []
     if (seededForRef.current === key) {
@@ -289,6 +319,19 @@ export function PastRoundMap({
     [placed, activeIdx],
   )
 
+  // OB flag per breadcrumb waypoint (#839), index-aligned with
+  // `previousStarts` — built with the identical slice(0, activeIdx) +
+  // "has a start" filter so a dropped entry drops from both arrays at the
+  // same index, never just one.
+  const previousShotObs = useMemo(
+    () =>
+      placed
+        .slice(0, activeIdx)
+        .filter((s) => s.start != null)
+        .map((s) => s.ob === true),
+    [placed, activeIdx],
+  )
+
   const startedCount = useMemo(
     () => placed.filter((s) => s.start != null).length,
     [placed],
@@ -312,13 +355,19 @@ export function PastRoundMap({
   }, [placed, tee, effectivePin])
 
   // Keep hole_scores.score honest with the placed-shot count (a placed shot
-  // IS a stroke). Pure score-only entry on the scorecard is untouched —
-  // this only fires when the map owns shot creation for the hole.
+  // IS a stroke) plus this hole's penalty strokes — a stroke-and-distance OB
+  // has no row of its own, so a raw row count would silently revert it
+  // (#839). Scoped to this hole_score_id, never round-wide. Pure score-only
+  // entry on the scorecard is untouched — this only fires when the map owns
+  // shot creation for the hole.
   async function syncScore(count: number) {
     if (!currentHoleScore) return
+    const obStrokes = obCount(
+      shots.filter((s) => s.hole_score_id === currentHoleScore.id),
+    )
     const { data, error } = await supabase
       .from('hole_scores')
-      .update({ score: count })
+      .update({ score: count + obStrokes })
       .eq('id', currentHoleScore.id)
       .eq('round_id', roundId)
       .select()
@@ -599,7 +648,7 @@ export function PastRoundMap({
     onHoleChange(next)
   }
 
-  const par = currentHole?.par ?? null
+  const par = resolvedHole?.par ?? currentHole?.par ?? null
 
   return (
     <View style={{ flex: 1, backgroundColor: '#1C211C' }}>
@@ -657,6 +706,7 @@ export function PastRoundMap({
           aim={active?.aim ?? null}
           ball={active?.start ?? null}
           previousShots={previousStarts}
+          previousShotObs={previousShotObs}
           // REVIEW is always flat top-down (PLACE_BALL) so the selected marker
           // drags; LOGGING follows the BALL/AIM/PIN mode chips.
           phase={completed ? 'PLACE_BALL' : mode}

@@ -14,6 +14,7 @@ import {
   horizontalBreakFromAim,
   isPuttEntry,
   isPuttShot,
+  obCount,
   tourMakePercent,
   type BreakDirectionHorizontal,
   type BreakDirectionVertical,
@@ -51,6 +52,16 @@ interface HoleReviewSheetProps {
    *  is a putt, this data overrides the defaults so the user doesn't
    *  re-enter what they just answered. */
   placedPutts?: (WebPuttData | null)[]
+  /** The hole's already-stored shots. Used only to seed `shotResult: 'ob'`
+   *  onto the hydrated rows so (a) the score ticker counts the penalty
+   *  stroke a mobile live-capture recorded, and (b) `saveReviewedHole` can
+   *  derive `ob` from the row alone — matching mobile — instead of OR-ing in
+   *  the stored flag, which cannot be cleared from this sheet once set.
+   *  Keyed by shot number and gated on an equal count, for the same reason
+   *  saveReviewedHole's snapshot is: `placedPoints` is never seeded from
+   *  stored shots, so a re-placement with a different shot count has no
+   *  correspondence to them and a stale flag would land on the wrong shot. */
+  storedShots?: ReadonlyArray<{ shotNumber: number; ob?: boolean | null }>
   saving: boolean
   /** "Edit on map" — close the sheet and let the user drag markers. */
   onEditOnMap: () => void
@@ -99,6 +110,7 @@ export function HoleReviewSheet({
   pinLng,
   placedPoints,
   placedPutts,
+  storedShots,
   saving,
   onEditOnMap,
   onSave,
@@ -124,6 +136,8 @@ export function HoleReviewSheet({
   placedPointsRef.current = placedPoints
   const placedPuttsRef = useRef(placedPutts)
   placedPuttsRef.current = placedPutts
+  const storedShotsRef = useRef(storedShots)
+  storedShotsRef.current = storedShots
 
   // Hydrate rows from the placed coordinates once per (hole, open). After
   // hydration the user's typing/dropdown choices are the source of truth —
@@ -190,8 +204,31 @@ export function HoleReviewSheet({
               : row.distanceYards,
         }
       })
-    setRows(merged)
-    setScore(merged.length)
+    // Seed OB from the hole's already-stored shots BEFORE anything reads the
+    // rows. Web has no live capture, so buildInitialRows / the no-pin
+    // fallback / the putt merge never set `shotResult`; without this the
+    // sheet shows no OB chip for a hole marked OB on mobile and seeds the
+    // score one stroke low, then persists that lower value over a correct
+    // one. Keyed by shot number (not position) and gated on an equal count,
+    // for the same reason saveReviewedHole's snapshot is: `placedPoints` is
+    // a fresh placement with no correspondence to the stored shots, so on a
+    // count mismatch dropping the flag is correct and moving it to a
+    // different shot would be worse (#839).
+    const stored = storedShotsRef.current ?? []
+    let seeded = merged
+    if (stored.length === merged.length) {
+      const obByNumber = new Map(stored.map((s) => [s.shotNumber, s.ob === true]))
+      seeded = merged.map((row) =>
+        obByNumber.get(row.shotNumber) ? { ...row, shotResult: 'ob' as const } : row,
+      )
+    }
+    setRows(seeded)
+    // Struck rows + penalty strokes. obCount reads the `shotResult: 'ob'`
+    // the seed above applied, so this is 0 only when the hole has no stored
+    // OB or the count guard rejected the seed. The ±1 bump in the
+    // result-picker's onChange below covers edits made after hydration,
+    // which this effect deliberately does not re-run for (#839).
+    setScore(seeded.length + obCount(seeded))
     // Putt TALLY counts any green-lie shot (isPuttShot), matching the SG
     // putting engine + putt-count readers — a bladed wedge on the green still
     // counts as a putt here even though its row shows normal-shot UI (the
@@ -315,7 +352,30 @@ export function HoleReviewSheet({
               key={row.shotNumber}
               row={row}
               onOpenAimer={() => setAimingShot(row.shotNumber)}
-              onChange={(next) =>
+              onChange={(next) => {
+                // The score ticker starts at struck-count (obCount is always
+                // 0 at seed time — see the hydration effect above) and stays
+                // accurate from here on by bumping ±1 every time THIS row's
+                // shotResult flips to/from 'ob'. This is the only place
+                // shotResult can become 'ob' on web (the result-picker chip
+                // in ShotRow), so a flip here is the complete signal — no
+                // other write path needs to feed this counter (#839).
+                // Compared here against `row` (this render's rows[idx]) in
+                // the plain event-handler body, deliberately NOT inside the
+                // setRows updater below — a setState call as a side effect
+                // of another state's updater function would double-fire
+                // under dev Strict Mode's intentional double-invocation of
+                // updaters, actually incrementing the score twice.
+                if (next.shotResult !== row.shotResult) {
+                  if (next.shotResult === 'ob' && row.shotResult !== 'ob') {
+                    setScore((s) => s + 1)
+                  } else if (
+                    row.shotResult === 'ob' &&
+                    next.shotResult !== 'ob'
+                  ) {
+                    setScore((s) => Math.max(0, s - 1))
+                  }
+                }
                 setRows((prev) => {
                   const copy = prev.slice()
                   copy[idx] = next
@@ -350,7 +410,7 @@ export function HoleReviewSheet({
                   }
                   return copy
                 })
-              }
+              }}
             />
           ))}
           </>

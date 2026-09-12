@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { inferHoleCount, isPuttShot } from '@oga/core'
+import { inferHoleCount, isPuttShot, resolveCourseTee, resolveHole, type ResolvedHole } from '@oga/core'
+import { getHoleTeesForCourse } from '@oga/supabase'
 import type { Database } from '@oga/supabase'
 import {
   pendingShotsForHoleScore,
@@ -12,6 +13,8 @@ import type { LatLng } from '../HoleMap'
 type HoleRow = Database['public']['Tables']['holes']['Row']
 type HoleScoreRow = Database['public']['Tables']['hole_scores']['Row']
 type RoundRow = Database['public']['Tables']['rounds']['Row']
+type CourseTeeRow = Database['public']['Tables']['course_tees']['Row']
+type HoleTeeRow = Database['public']['Tables']['hole_tees']['Row']
 
 export interface UseHoleDataResult {
   round: RoundRow | null
@@ -27,6 +30,14 @@ export interface UseHoleDataResult {
   effectiveHoles: HoleRow[]
   currentHole: HoleRow | null
   currentHoleScore: HoleScoreRow | null
+  /** Tee-resolved par/yards/stroke_index/tee-location for currentHole —
+   *  hole_tees override for the round's selected tee (if any) over the
+   *  base holes row, with hole_scores.par folded in. Additive: consumers
+   *  that need raw base values keep reading currentHole directly. */
+  resolvedHole: ResolvedHole | null
+  /** Same resolution keyed by hole number, for every hole — ScorecardModal
+   *  renders all holes, not just currentHole. */
+  resolvedHoleByNumber: Map<number, ResolvedHole>
   storedPin: LatLng | null
   roundPin: LatLng | null
   tee: LatLng | null
@@ -38,6 +49,12 @@ export interface UseHoleDataResult {
   setPendingForHole: React.Dispatch<React.SetStateAction<PendingShot[]>>
   previousShots: LatLng[]
   previousShotIds: string[]
+  /** Out-of-bounds flag per shot, aligned 1:1 with `previousShotIds` (same
+   *  order, same length, same filters). Drives the live OB chip's
+   *  set-vs-undo state so it is DERIVED from the stored rows rather than
+   *  remembered in component state — a mid-hole reload must not offer to
+   *  mark an already-OB shot again and double-charge the penalty (#839). */
+  previousShotObs: boolean[]
   refreshShots: () => void
   localShotCount: number
   localPuttCount: number
@@ -52,6 +69,8 @@ export function useHoleData(
   const [courseCenter, setCourseCenter] = useState<LatLng | null>(null)
   const [holes, setHoles] = useState<HoleRow[]>([])
   const [holeScores, setHoleScores] = useState<HoleScoreRow[]>([])
+  const [courseTees, setCourseTees] = useState<CourseTeeRow[]>([])
+  const [holeTees, setHoleTees] = useState<HoleTeeRow[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [remoteShotCount, setRemoteShotCount] = useState(0)
@@ -59,6 +78,7 @@ export function useHoleData(
   const [pendingForHole, setPendingForHole] = useState<PendingShot[]>([])
   const [remoteShotStarts, setRemoteShotStarts] = useState<LatLng[]>([])
   const [remoteShotIds, setRemoteShotIds] = useState<string[]>([])
+  const [remoteShotObs, setRemoteShotObs] = useState<boolean[]>([])
   const [shotsRefreshNonce, setShotsRefreshNonce] = useState(0)
   const refreshShots = useCallback(() => setShotsRefreshNonce((n) => n + 1), [])
 
@@ -108,6 +128,47 @@ export function useHoleData(
     [holeScores, currentHole?.id],
   )
 
+  // Resolve which course_tees row this round is playing (id preferred,
+  // tee_color as legacy fallback), then that tee's hole_tees override (if
+  // any) for the current hole. Sparse by design — most courses have none
+  // yet, so this is a no-op for the common case and everything falls
+  // through to the base `holes` row.
+  const resolvedCourseTee = useMemo(
+    () => resolveCourseTee(courseTees, round?.course_tee_id, round?.tee_color),
+    [courseTees, round?.course_tee_id, round?.tee_color],
+  )
+  const holeTeeByHoleId = useMemo(() => {
+    const m = new Map<string, HoleTeeRow>()
+    if (!resolvedCourseTee) return m
+    for (const ht of holeTees) {
+      if (ht.course_tee_id === resolvedCourseTee.id) m.set(ht.hole_id, ht)
+    }
+    return m
+  }, [holeTees, resolvedCourseTee])
+  const resolvedHole = useMemo(
+    () =>
+      currentHole
+        ? resolveHole(currentHole, holeTeeByHoleId.get(currentHole.id) ?? null, {
+            par: currentHoleScore?.par,
+          })
+        : null,
+    [currentHole, holeTeeByHoleId, currentHoleScore?.par],
+  )
+
+  // Same resolution for every hole (no live drag override — that only
+  // applies to whichever hole is currently being edited) — for consumers
+  // that render/sum over all holes (ScorecardModal) rather than just the
+  // current one.
+  const resolvedHoleByNumber = useMemo(() => {
+    const m = new Map<number, ResolvedHole>()
+    for (const h of effectiveHoles) {
+      const teeOverride = holeTeeByHoleId.get(h.id) ?? null
+      const hs = holeScores.find((s) => s.hole_id === h.id)
+      m.set(h.number, resolveHole(h, teeOverride, { par: hs?.par }))
+    }
+    return m
+  }, [effectiveHoles, holeTeeByHoleId, holeScores])
+
   const storedPin: LatLng | null =
     currentHole?.pin_lat != null && currentHole.pin_lng != null
       ? { lat: currentHole.pin_lat, lng: currentHole.pin_lng }
@@ -116,14 +177,15 @@ export function useHoleData(
     currentHoleScore?.pin_lat != null && currentHoleScore.pin_lng != null
       ? { lat: currentHoleScore.pin_lat, lng: currentHoleScore.pin_lng }
       : null
-  // The course's stored tee (OSM-mapped or synthetic). Used as the pre-shot
-  // fallback; once the player has hit, the live tee is their first shot's
-  // start (see `tee` below) — most courses now carry an OSM tee, and pinning
-  // the marker there instead of where the player actually teed off is wrong
-  // for the live round.
+  // The course's stored tee (OSM-mapped or synthetic, tee-resolved — a
+  // hole_tees override for this tee wins over the base holes.tee_lat/lng).
+  // Used as the pre-shot fallback; once the player has hit, the live tee
+  // is their first shot's start (see `tee` below) — most courses now
+  // carry an OSM tee, and pinning the marker there instead of where the
+  // player actually teed off is wrong for the live round.
   const storedTee: LatLng | null =
-    currentHole?.tee_lat != null && currentHole.tee_lng != null
-      ? { lat: currentHole.tee_lat, lng: currentHole.tee_lng }
+    resolvedHole?.teeLat != null && resolvedHole?.teeLng != null
+      ? { lat: resolvedHole.teeLat, lng: resolvedHole.teeLng }
       : null
 
   const loadAll = useCallback(async () => {
@@ -148,14 +210,20 @@ export function useHoleData(
           : null,
       )
 
-      const [hRes, hsRes] = await Promise.all([
+      const [hRes, hsRes, ctRes, htRes] = await Promise.all([
         supabase.from('holes').select('*').eq('course_id', r.course_id).order('number'),
         supabase.from('hole_scores').select('*').eq('round_id', r.id),
+        supabase.from('course_tees').select('*').eq('course_id', r.course_id),
+        getHoleTeesForCourse(supabase, r.course_id),
       ])
       if (hRes.error) throw hRes.error
       if (hsRes.error) throw hsRes.error
+      if (ctRes.error) throw ctRes.error
+      if (htRes.error) throw htRes.error
       setHoles(hRes.data ?? [])
       setHoleScores(hsRes.data ?? [])
+      setCourseTees(ctRes.data ?? [])
+      setHoleTees(htRes.data ?? [])
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -207,6 +275,7 @@ export function useHoleData(
       setRemotePuttCount(0)
       setRemoteShotStarts([])
       setRemoteShotIds([])
+      setRemoteShotObs([])
       setPendingForHole([])
     }
     if (!currentHoleScore) return
@@ -216,7 +285,7 @@ export function useHoleData(
         const fetchShots = () =>
           supabase
             .from('shots')
-            .select('id, club, lie_type, shot_number, start_lat, start_lng')
+            .select('id, club, lie_type, shot_number, start_lat, start_lng, ob')
             .eq('hole_score_id', currentHoleScore.id)
             .order('shot_number')
         const [shotsResInitial, localInitial] = await Promise.all([
@@ -281,14 +350,17 @@ export function useHoleData(
         setRemotePuttCount(shots.filter((s) => isPuttShot(s.lie_type)).length)
         const starts: LatLng[] = []
         const ids: string[] = []
+        const obs: boolean[] = []
         for (const r of shots) {
           if (r.start_lat != null && r.start_lng != null) {
             starts.push({ lat: r.start_lat, lng: r.start_lng })
             ids.push(r.id)
+            obs.push(r.ob === true)
           }
         }
         setRemoteShotStarts(starts)
         setRemoteShotIds(ids)
+        setRemoteShotObs(obs)
         setPendingForHole(dedupedLocal)
       } catch (err) {
         if (myNonce !== fetchNonceRef.current) return
@@ -311,12 +383,21 @@ export function useHoleData(
   // pending shot starts (in pending insertion order). The current ball
   // is intentionally excluded — HoleMap appends it as the line's final
   // segment so the ball can move while the breadcrumb stays.
+  //
+  // INVARIANT: this filter and those of `previousShotIds` / `previousShotObs`
+  // below must stay IDENTICAL — the three arrays are consumed by index, and a
+  // payload admitted by one but not another shifts every later index. That
+  // alignment now decides which shot markLastShotOb writes `ob: true` to,
+  // which waypoint wears the OB badge, and which row summaryRows stamps —
+  // the row that then sets the hole score (#839). `p.id` is redundant today
+  // (insertPendingShot always stamps one) but is kept here so the invariant
+  // is structural rather than a coincidence of three call sites.
   const previousShots = useMemo(() => {
     const out: LatLng[] = [...remoteShotStarts]
     for (const r of pendingForHole) {
       try {
         const p = JSON.parse(r.payload) as ShotPayload
-        if (p.start_lat != null && p.start_lng != null) {
+        if (p.start_lat != null && p.start_lng != null && p.id) {
           out.push({ lat: p.start_lat, lng: p.start_lng })
         }
       } catch {
@@ -329,6 +410,7 @@ export function useHoleData(
   // Shot client-ids aligned 1:1 with `previousShots` (same order + length), so
   // the summary can map a row to its shot for delete_shot. Remote ids come from
   // the server rows; pending ids from payload.id (always set on insert, db.ts).
+  // Same filter as `previousShots` above — see the invariant note there.
   const previousShotIds = useMemo(() => {
     const out: string[] = [...remoteShotIds]
     for (const r of pendingForHole) {
@@ -343,6 +425,27 @@ export function useHoleData(
     }
     return out
   }, [remoteShotIds, pendingForHole])
+
+  // OB flag per shot, built with the SAME filters as previousShots /
+  // previousShotIds above so all three stay index-aligned (a shot's position,
+  // id and OB state must never drift apart — see the invariant note on
+  // previousShots). Pending payloads carry `ob` themselves — buildPayload writes it,
+  // and the live OB chip patches it back into SQLite so this stays true for a
+  // shot flagged after it was queued (#839).
+  const previousShotObs = useMemo(() => {
+    const out: boolean[] = [...remoteShotObs]
+    for (const r of pendingForHole) {
+      try {
+        const p = JSON.parse(r.payload) as ShotPayload
+        if (p.start_lat != null && p.start_lng != null && p.id) {
+          out.push(p.ob === true)
+        }
+      } catch {
+        // skip malformed pending payload (matches previousShotIds)
+      }
+    }
+    return out
+  }, [remoteShotObs, pendingForHole])
 
   // Live tee anchor: the player's first shot's start IS the tee. Falls back to
   // the stored course tee before the first shot (camera + pre-shot distances).
@@ -379,6 +482,8 @@ export function useHoleData(
     effectiveHoles,
     currentHole,
     currentHoleScore,
+    resolvedHole,
+    resolvedHoleByNumber,
     storedPin,
     roundPin,
     tee,
@@ -390,6 +495,7 @@ export function useHoleData(
     setPendingForHole,
     previousShots,
     previousShotIds,
+    previousShotObs,
     refreshShots,
     localShotCount,
     localPuttCount,

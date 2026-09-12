@@ -8,6 +8,7 @@ import { LearnShell } from './components/landing/LearnShell'
 import { RouteErrorBoundary } from './components/errors/ErrorBoundary'
 import { LoginPage } from './pages/auth/LoginPage'
 import { SignupPage } from './pages/auth/SignupPage'
+import { AuthCallbackPage } from './pages/auth/AuthCallbackPage'
 import { NotFoundPage } from './pages/errors/NotFoundPage'
 import { OnboardingPage } from './pages/onboarding/OnboardingPage'
 import { LandingPage } from './pages/landing/LandingPage'
@@ -34,6 +35,9 @@ const ShotPatternsPage = lazy(() =>
 const RoundDetailPage = lazy(() =>
   import('./pages/rounds/RoundDetailPage').then((m) => ({ default: m.RoundDetailPage })),
 )
+const ImportDataPage = lazy(() =>
+  import('./pages/rounds/ImportDataPage').then((m) => ({ default: m.ImportDataPage })),
+)
 const LearnPage = lazy(() =>
   import('./pages/learn/LearnPage').then((m) => ({ default: m.LearnPage })),
 )
@@ -50,6 +54,23 @@ const SupportPage = lazy(() =>
 )
 const CoursePlanPage = lazy(() => import('./pages/plan/CoursePlanPage'))
 const HolePlanPage = lazy(() => import('./pages/plan/HolePlanPage'))
+// Dev-only Course Editor + ops dashboard — their backends (vite-plugins/
+// dev-course-api.ts, vite-plugins/dev-admin-api.ts) only exist under
+// `vite dev`, so the routes are gated on import.meta.env.DEV below.
+//
+// The lazy() calls themselves live inside that same gate (see the IIFE at
+// the route-array callsite), not just the JSX that renders them. Proved
+// against the built artifact that declaring
+// `const X = lazy(() => import('./X'))` up here, outside the
+// gate, does NOT tree-shake out of a production build even though the JSX
+// using X does: React.lazy() is a plain function call, not something
+// Rollup can prove is free of side effects, so it keeps the call — and
+// the dynamic import() inside it still forces its own chunk into
+// dist/assets, fully populated with that page's copy and API paths,
+// reachable by direct request on any static host serving the build. Only
+// wrapping the declaration itself in the same statically-false branch as
+// the JSX removes it: dead-branch elimination doesn't need purity, it
+// just deletes code that provably can't run.
 
 function RouteFallback() {
   return (
@@ -102,6 +123,7 @@ const routes: RouteObject[] = [
   },
   { path: '/login', element: <LoginPage />, errorElement },
   { path: '/signup', element: <SignupPage />, errorElement },
+  { path: '/auth/callback', element: <AuthCallbackPage />, errorElement },
   {
     path: '/onboarding',
     element: <AuthGuard><OnboardingPage /></AuthGuard>,
@@ -114,6 +136,7 @@ const routes: RouteObject[] = [
       { path: '/dashboard', element: <DashboardPage />, errorElement },
       { path: '/rounds', element: <RoundsPage />, errorElement },
       { path: '/rounds/new', element: <NewRoundPage />, errorElement },
+      { path: '/rounds/import', element: <ImportDataPage />, errorElement },
       { path: '/rounds/:id', element: <RoundDetailPage />, errorElement },
       { path: '/stats', element: <StrokesGainedPage />, errorElement },
       { path: '/patterns', element: <ShotPatternsPage />, errorElement },
@@ -123,6 +146,20 @@ const routes: RouteObject[] = [
       { path: '/plan/:courseId/:holeNumber', element: <HolePlanPage />, errorElement },
       { path: '/settings', element: <SettingsPage />, errorElement },
       { path: '/settings/bag', element: <BagPage />, errorElement },
+      ...(import.meta.env.DEV
+        ? (() => {
+            const CourseEditorIndexPage = lazy(
+              () => import('./pages/dev-editor/CourseEditorIndexPage'),
+            )
+            const CourseEditorPage = lazy(() => import('./pages/dev-editor/CourseEditorPage'))
+            const AdminDashboardPage = lazy(() => import('./pages/dev-admin/AdminDashboardPage'))
+            return [
+              { path: '/dev/courses', element: <CourseEditorIndexPage />, errorElement },
+              { path: '/dev/courses/:id/edit', element: <CourseEditorPage />, errorElement },
+              { path: '/dev/admin', element: <AdminDashboardPage />, errorElement },
+            ]
+          })()
+        : []),
     ],
   },
   { path: '*', element: <NotFoundPage />, errorElement },

@@ -16,6 +16,7 @@ import {
   horizontalBreakFromAim,
   isPuttEntry,
   isPuttShot,
+  obCount,
   type BreakDirectionHorizontal,
   type BreakDirectionVertical,
   type Club,
@@ -150,7 +151,12 @@ export function HoleReviewSheet({
     const next = initialRowsRef.current
     const ids = shotIdsRef.current
     setRows(next.map((r, i) => ({ ...r, _shotId: ids[i] })))
-    setScore(next.length)
+    // Score seeds from the rows: struck rows + penalty strokes. A
+    // stroke-and-distance OB has no row of its own, and the caller marks it on
+    // the row it belongs to (shotResult 'ob') — without that term the ticker
+    // would re-seed to the struck count and Save would persist it back over
+    // the live chip's bump (#839).
+    setScore(next.length + obCount(next))
     // Putt TALLY counts any green-lie shot (isPuttShot), matching the SG
     // putting engine + putt-count readers — a bladed wedge on the green still
     // counts as a putt here even though its row shows normal-shot UI (the
@@ -163,12 +169,26 @@ export function HoleReviewSheet({
 
   const vsPar = score > 0 ? score - par : null
 
-  const setRow = (idx: number, nextRow: ReviewedShotRow) =>
+  const setRow = (idx: number, nextRow: ReviewedShotRow) => {
+    // Keep the Score ticker in step when the result picker flips a row into
+    // or out of 'ob'. An OB row is worth two strokes (the shot plus its
+    // rowless stroke-and-distance penalty), and hydration already counted
+    // any seeded OB — so without this, clearing OB on a row leaves the
+    // score a stroke high and setting it leaves the score a stroke low.
+    // Transition-driven, not value-driven: re-selecting the same result is
+    // a no-op and cannot double-count. Mirrors web's bump in
+    // apps/web/src/components/round/HoleReviewSheet.tsx (#839).
+    const prevRow = rows[idx]
+    if (prevRow && nextRow.shotResult !== prevRow.shotResult) {
+      if (nextRow.shotResult === 'ob') setScore((s) => s + 1)
+      else if (prevRow.shotResult === 'ob') setScore((s) => Math.max(0, s - 1))
+    }
     setRows((prev) => {
       const copy = prev.slice()
       copy[idx] = { ...nextRow, _shotId: prev[idx]?._shotId }
       return copy
     })
+  }
 
   const confirmDelete = (row: EditableRow) => {
     if (!row._shotId || saving) return
@@ -198,8 +218,11 @@ export function HoleReviewSheet({
                 ),
             )
             // Keep the tickers honest: one fewer shot, and one fewer putt if it
-            // was a green-lie shot (matches the RPC's re-tally).
-            setScore((s) => Math.max(0, s - 1))
+            // was a green-lie shot (matches the RPC's re-tally). An OB row is
+            // worth TWO strokes — the shot plus its stroke-and-distance
+            // penalty, which has no row of its own — so deleting it drops 2,
+            // matching what delete_shot re-tallies server-side.
+            setScore((s) => Math.max(0, s - (row.shotResult === 'ob' ? 2 : 1)))
             if (isPuttShot(row.lieType)) setPutts((p) => Math.max(0, p - 1))
           },
         },
