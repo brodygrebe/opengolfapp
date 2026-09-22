@@ -232,6 +232,7 @@ export default function AppLayout() {
       <Tabs.Screen name="bag" options={{ href: null }} />
       <Tabs.Screen name="rounds" options={{ href: null }} />
       <Tabs.Screen name="round/new" options={{ href: null }} />
+      <Tabs.Screen name="club/[code]" options={{ href: null }} />
       {/* Live round is full-bleed — hide the tab bar entirely while it's
           focused (not just the tab button) to reclaim the bottom strip. */}
       <Tabs.Screen
