@@ -49,6 +49,7 @@ export interface UseHoleDataResult {
   setPendingForHole: React.Dispatch<React.SetStateAction<PendingShot[]>>
   previousShots: LatLng[]
   previousShotIds: string[]
+  previousShotClubs: Array<string | null>
   /** Out-of-bounds flag per shot, aligned 1:1 with `previousShotIds` (same
    *  order, same length, same filters). Drives the live OB chip's
    *  set-vs-undo state so it is DERIVED from the stored rows rather than
@@ -78,6 +79,7 @@ export function useHoleData(
   const [pendingForHole, setPendingForHole] = useState<PendingShot[]>([])
   const [remoteShotStarts, setRemoteShotStarts] = useState<LatLng[]>([])
   const [remoteShotIds, setRemoteShotIds] = useState<string[]>([])
+  const [remoteShotClubs, setRemoteShotClubs] = useState<Array<string | null>>([])
   const [remoteShotObs, setRemoteShotObs] = useState<boolean[]>([])
   const [shotsRefreshNonce, setShotsRefreshNonce] = useState(0)
   const refreshShots = useCallback(() => setShotsRefreshNonce((n) => n + 1), [])
@@ -275,6 +277,7 @@ export function useHoleData(
       setRemotePuttCount(0)
       setRemoteShotStarts([])
       setRemoteShotIds([])
+      setRemoteShotClubs([])
       setRemoteShotObs([])
       setPendingForHole([])
     }
@@ -350,16 +353,19 @@ export function useHoleData(
         setRemotePuttCount(shots.filter((s) => isPuttShot(s.lie_type)).length)
         const starts: LatLng[] = []
         const ids: string[] = []
+        const clubs: Array<string | null> = []
         const obs: boolean[] = []
         for (const r of shots) {
           if (r.start_lat != null && r.start_lng != null) {
             starts.push({ lat: r.start_lat, lng: r.start_lng })
             ids.push(r.id)
+            clubs.push(r.club)
             obs.push(r.ob === true)
           }
         }
         setRemoteShotStarts(starts)
         setRemoteShotIds(ids)
+        setRemoteShotClubs(clubs)
         setRemoteShotObs(obs)
         setPendingForHole(dedupedLocal)
       } catch (err) {
@@ -425,6 +431,21 @@ export function useHoleData(
     }
     return out
   }, [remoteShotIds, pendingForHole])
+
+  const previousShotClubs = useMemo(() => {
+    const out: Array<string | null> = [...remoteShotClubs]
+    for (const r of pendingForHole) {
+      try {
+        const p = JSON.parse(r.payload) as ShotPayload
+        if (p.start_lat != null && p.start_lng != null && p.id) {
+          out.push(p.club ?? null)
+        }
+      } catch {
+        // skip malformed pending payload (matches previousShotIds)
+      }
+    }
+    return out
+  }, [remoteShotClubs, pendingForHole])
 
   // OB flag per shot, built with the SAME filters as previousShots /
   // previousShotIds above so all three stay index-aligned (a shot's position,
@@ -495,6 +516,7 @@ export function useHoleData(
     setPendingForHole,
     previousShots,
     previousShotIds,
+    previousShotClubs,
     previousShotObs,
     refreshShots,
     localShotCount,

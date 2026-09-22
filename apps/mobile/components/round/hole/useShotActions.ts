@@ -11,6 +11,7 @@ import {
   isPuttShot,
   projectShotMove,
   type CaptureMode,
+  type Club,
   type LieType,
   type ReviewedShotRow,
 } from '@oga/core'
@@ -70,6 +71,8 @@ interface UseShotActionsInput {
   // predicate's "active capture hole" signal (fix round 2, C1 residual):
   // only a real finish should ever make a hole editable, not a peek ahead.
   onAdvanceHole: (next: number) => void
+  selectedClub: Club | null
+  onClubConsumed: () => void
 }
 
 export interface UseShotActionsResult {
@@ -155,6 +158,8 @@ export function useShotActions(input: UseShotActionsInput): UseShotActionsResult
     placeBallManually,
     onHoleChange,
     onAdvanceHole,
+    selectedClub,
+    onClubConsumed,
   } = input
   const router = useRouter()
   const [saving, setSaving] = useState(false)
@@ -325,7 +330,8 @@ export function useShotActions(input: UseShotActionsInput): UseShotActionsResult
     opts?: { forceAim?: boolean; ball?: LatLng },
   ) {
     if (persistShotInFlightRef.current) return
-    const base = buildPayload(meta, opts)
+    const effectiveMeta = meta ?? (selectedClub ? { club: selectedClub } : null)
+    const base = buildPayload(effectiveMeta, opts)
     if (!base) return
     // Stamp the client id up front so the optimistic pending entry below carries
     // the SAME id that insertPendingShot persists to SQLite. Without it, the
@@ -352,6 +358,7 @@ export function useShotActions(input: UseShotActionsInput): UseShotActionsResult
       setAim(null)
       setLoggerOpen(false)
       setLoggerInitial({})
+      if (selectedClub && payload.club === selectedClub) onClubConsumed()
       setRoundState('PLACE_BALL')
       // Background sync — don't await.
       syncPendingShots().catch(() => undefined)
