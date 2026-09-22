@@ -83,10 +83,12 @@ const KICKER: import('react-native').TextStyle = {
 // a past round from the home list isn't dropped back into the
 // Mark-ball / Set-aim state machine.
 export default function RoundIndex() {
-  const { id, hole, mode } = useLocalSearchParams<{
+  const { id, hole, mode, club, clubToken } = useLocalSearchParams<{
     id: string
     hole?: string
     mode?: string
+    club?: string
+    clubToken?: string
   }>()
   const router = useRouter()
   const insets = useSafeAreaInsets()
@@ -362,6 +364,10 @@ export default function RoundIndex() {
     (next: number) => router.setParams({ hole: String(next) }),
     [router],
   )
+  const clearClubFromUrl = useCallback(
+    () => router.setParams({ club: undefined, clubToken: undefined }),
+    [router],
+  )
 
   // In-progress rounds mount the live session here — the path-segmented
   // hole route is deprecated, see #264. holeNumber is component state
@@ -383,6 +389,9 @@ export default function RoundIndex() {
         mode="live"
         captureMode={(round?.capture_mode ?? 'track_patterns') as CaptureMode}
         onHoleChange={syncHoleToUrl}
+        requestedClub={club}
+        requestedClubToken={clubToken}
+        onRequestedClubConsumed={clearClubFromUrl}
       />
     )
   }
