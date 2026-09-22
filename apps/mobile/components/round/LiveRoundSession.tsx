@@ -15,10 +15,13 @@ import { ShotStepper } from './ShotStepper'
 import type { ShotLoggerValue } from './ShotLogger'
 import {
   DEFAULT_HANDICAP,
+  CLUBS,
   bearingDegrees,
   buildInitialRows,
   destinationYards,
+  formatClubLabel,
   type CaptureMode,
+  type Club,
 } from '@oga/core'
 import { getProfile } from '@oga/supabase'
 import { supabase } from '../../lib/supabase'
@@ -67,6 +70,9 @@ interface LiveRoundSessionProps {
   // remount the screen, which is the whole point of this component.
   // Optional so the component can be tested or driven without URL sync.
   onHoleChange?: (next: number) => void
+  requestedClub?: string
+  requestedClubToken?: string
+  onRequestedClubConsumed?: () => void
 }
 
 // Resident live-round screen. Owns the MapView for the full round so
@@ -79,6 +85,9 @@ export default function LiveRoundSession({
   mode,
   captureMode,
   onHoleChange: syncHoleToUrl,
+  requestedClub,
+  requestedClubToken,
+  onRequestedClubConsumed,
 }: LiveRoundSessionProps) {
   const isPastMode = mode === 'past'
   const router = useRouter()
@@ -111,6 +120,17 @@ export default function LiveRoundSession({
   // in ./hole/types for the full union + rationale (#293).
   const [activeDialog, setActiveDialog] = useState<ActiveDialog>(null)
   const [loggerInitial, setLoggerInitial] = useState<ShotLoggerValue>({})
+  const requestedClubIsValid =
+    requestedClub != null && CLUBS.includes(requestedClub as Club)
+  const [selectedClub, setSelectedClub] = useState<Club | null>(
+    requestedClubIsValid ? (requestedClub as Club) : null,
+  )
+
+  useEffect(() => {
+    if (requestedClub && CLUBS.includes(requestedClub as Club)) {
+      setSelectedClub(requestedClub as Club)
+    }
+  }, [requestedClub, requestedClubToken])
   // Left-toolbar dispersion-dots toggle (T2). Drives the single-color
   // historical-shot scatter overlay; the render lands in T4. Off by
   // default — it's a summoned planning aid, not always-on clutter.
@@ -370,6 +390,11 @@ export default function LiveRoundSession({
       setHoleNumber(next)
       syncHoleToUrl?.(next)
     },
+    selectedClub,
+    onClubConsumed: () => {
+      setSelectedClub(null)
+      onRequestedClubConsumed?.()
+    },
   })
 
   // End-of-hole review rows. Built from the shots placed live (their start
@@ -400,12 +425,15 @@ export default function LiveRoundSession({
     // reason the chip's label is (see the OB props below): the fetched flags
     // lag our own write by a refetch, and finishing the hole inside that
     // window would seed the sheet without the penalty.
-    return buildInitialRows(pts, par, pin.lat, pin.lng).map((r, i) =>
-      actions.shotObs[i] ? { ...r, shotResult: 'ob' as const } : r,
-    )
+    return buildInitialRows(pts, par, pin.lat, pin.lng).map((r, i) => ({
+      ...r,
+      ...(data.previousShotClubs[i] ? { club: data.previousShotClubs[i]! } : {}),
+      ...(actions.shotObs[i] ? { shotResult: 'ob' as const } : {}),
+    }))
   }, [
     finalState.roundState,
     data.previousShots,
+    data.previousShotClubs,
     actions.shotObs,
     data.roundPin,
     data.storedPin,
@@ -663,9 +691,19 @@ export default function LiveRoundSession({
           </Text>
         </View>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-          <Text style={[TYPE.kicker, { ...KICKER, color: 'rgba(242,238,229,0.45)' }]}>
-            Shot {data.shotNumber}
-          </Text>
+          <View style={{ alignItems: 'flex-end' }}>
+            <Text style={[TYPE.kicker, { ...KICKER, color: 'rgba(242,238,229,0.45)' }]}>
+              Shot {data.shotNumber}
+            </Text>
+            {selectedClub && (
+              <Text
+                accessibilityLiveRegion="polite"
+                style={[TYPE.kicker, { ...KICKER, color: '#D3A84A', marginTop: 3 }]}
+              >
+                {formatClubLabel({ club_type: selectedClub })} selected
+              </Text>
+            )}
+          </View>
           <PressableTouch
             accessibilityRole="button"
             accessibilityLabel="Round options"
